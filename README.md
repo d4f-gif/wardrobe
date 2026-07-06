@@ -1,19 +1,23 @@
 # Wardrobe: what to wear today
 
-A zero-token daily outfit recommender. Open `webapp/index.html` in a browser,
-pick the occasion (Work / School / Kids event), and it recommends layered
-outfits from your own closet based on live Washington, DC weather.
+A zero-token daily outfit recommender, live at
+https://yutingf.github.io/wardrobe/. Pick the occasion (Work / School / Kids
+event) and it recommends layered outfits from your own closet based on live
+Washington, DC weather.
 
 ## How it works
 
 - **Daily use costs zero tokens.** The page fetches the forecast from the free
   Open-Meteo API (no key needed) and runs a local rules engine. It makes no AI
-  calls.
-- **Cataloging costs tokens once per item.** Drop photos (several angles per
-  piece, low quality is fine) into `closet/photos/`, then ask Claude to
-  "catalog the new clothes." Claude looks at the photos once and appends a
-  structured text entry to `closet/catalog.js`. After that the photos never
-  reach a model again; the app reads only the text catalog.
+  calls and needs no server.
+- **Adding clothes also costs zero tokens.** The Add clothes tab has a camera
+  button (opens the phone camera) and a photo picker. A small CLIP vision
+  model (transformers.js, downloaded once and cached, ~100 MB) runs in the
+  browser to (1) group photos of the same garment shot from different angles,
+  and (2) draft each garment's category, color, pattern, and material with
+  confidence scores. You review and correct the drafts, then save. Items and
+  photos persist in the browser's IndexedDB; **photos never leave the
+  device**, so nothing personal reaches the public repo or any server.
 
 ## The rules engine (`webapp/engine.js`)
 
@@ -34,19 +38,28 @@ footwear is scored on six dimensions:
 5. **Material and season.** Linen in heat, wool/flannel/cashmere in cold, a
    denim-on-denim penalty, water-resistant outers and no suede when rain is
    likely.
-6. **Variety.** Outfits you logged (the "I'm wearing this" button) demote
-   those pieces for the next three days.
+6. **Variety.** The first top pick shown each day is logged automatically and
+   its pieces are demoted for the next three days.
 
 The top pick plus up to four diverse alternatives appear with a "why this
 works" explanation drawn from whichever rules fired.
 
+## Storage model
+
+Uploaded items live in IndexedDB, per browser, per device. The Closet tab can
+export the catalog as JSON (photos excluded) and import it on another device.
+Sample clothes in `closet/catalog.js` (flagged `sample: true`) make the app
+work out of the box and hide automatically, layer by layer, as real items come
+in. Claude can also append committed items to `closet/catalog.js` directly
+(see `CLAUDE.md`), which is useful for entries that should sync via git.
+
 ## Layout
 
 ```
-webapp/     index.html + engine.js (scoring) + app.js (UI, weather) + style.css
-closet/     catalog.js (the structured closet) + photos/ (your item photos)
+webapp/     index.html + engine.js (scoring) + app.js (UI, weather)
+            + cataloger.js (in-browser CLIP cataloging) + db.js (IndexedDB)
+            + style.css
+closet/     catalog.js (committed items + samples) + photos/ (optional,
+            for committed items only)
 test/       engine-test.js, run with `node test/engine-test.js`
 ```
-
-Sample clothes (flagged `sample: true` in the catalog) make the app work out of
-the box; they get deleted as the real closet fills in.

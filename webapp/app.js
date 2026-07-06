@@ -1,5 +1,6 @@
-/* app.js — UI layer: fetch DC weather, run the engine, render outfits.
-   Zero tokens: the only network call is to the free Open-Meteo API. */
+/* app.js — UI layer: fetch DC weather, run the engine, render outfits, and
+   host the in-browser cataloging flow. Zero tokens: the only network calls
+   are the free Open-Meteo API and the one-time CLIP model download. */
 
 'use strict';
 
@@ -64,6 +65,29 @@ async function fetchWeather() {
   };
 }
 
+// ------------------------------------------------------------------ closet (samples + user items)
+
+let userItems = []; // from IndexedDB, with _photoUrls object URLs attached
+
+async function loadUserItems() {
+  const items = await DBX.getAllItems();
+  for (const it of items) {
+    it._photoUrls = [];
+    for (const key of it.photoKeys || []) {
+      const blob = await DBX.getPhoto(key);
+      if (blob) it._photoUrls.push(URL.createObjectURL(blob));
+    }
+  }
+  userItems = items;
+}
+
+// Sample items stand in only until the real closet covers their layer.
+function mergedCatalog() {
+  const coveredLayers = new Set(userItems.map(it => it.layer));
+  const samples = CATALOG.filter(it => !(it.sample && coveredLayers.has(it.layer)));
+  return [...userItems, ...samples];
+}
+
 // ------------------------------------------------------------------ history (variety)
 
 function loadHistory() {
@@ -80,11 +104,13 @@ function recentWearMap() {
   return map;
 }
 
-function recordWear(items) {
+// The first top pick shown each day counts as "worn" for tomorrow's variety.
+function autoLogTopPick(outfit) {
   const date = new Date().toISOString().slice(0, 10);
-  const history = loadHistory().filter(e => e.date !== date).slice(-13);
-  history.push({ date, ids: items.map(it => it.id) });
-  localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+  const history = loadHistory();
+  if (history.some(e => e.date === date)) return;
+  history.push({ date, ids: outfit.items.map(it => it.id) });
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(-14)));
 }
 
 // ------------------------------------------------------------------ rendering
@@ -92,10 +118,16 @@ function recordWear(items) {
 const $ = sel => document.querySelector(sel);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-function itemCard(it, slotLabel) {
-  const photo = it.photos && it.photos[0];
-  const visual = photo
-    ? `<img class="item-photo" src="../closet/photos/${esc(photo)}" alt="${esc(it.name)}">`
+function photoUrl(it) {
+  if (it._photoUrls && it._photoUrls.length) return it._photoUrls[0];
+  if (it.photos && it.photos.length) return `../closet/photos/${it.photos[0]}`;
+  return null;
+}
+
+function itemCard(it, slotLabel, extraHTML = '') {
+  const url = photoUrl(it);
+  const visual = url
+    ? `<img class="item-photo" src="${esc(url)}" alt="${esc(it.name)}">`
     : `<div class="item-swatch" style="background:${SWATCH_HEX[(it.colors || [])[0]] || '#999'}">
          <span>${CATEGORY_EMOJI[it.category] || '🧺'}</span></div>`;
   return `<div class="item-card">
@@ -104,6 +136,7 @@ function itemCard(it, slotLabel) {
       <div class="item-slot">${esc(slotLabel)}</div>
       <div class="item-name">${esc(it.name)}</div>
       <div class="item-tags">${esc(it.material || '')}${it.pattern && it.pattern !== 'solid' ? ' · ' + esc(it.pattern) : ''}</div>
+      ${extraHTML}
     </div>
   </div>`;
 }
@@ -121,17 +154,14 @@ function outfitHTML(outfit, rank) {
   const reasons = outfit.reasons.slice(0, 4).map(r => `<li>${esc(r)}</li>`).join('');
   const warnings = outfit.warnings.slice(0, 2).map(w => `<li class="warn">${esc(w)}</li>`).join('');
   return `<div class="outfit ${rank === 0 ? 'primary' : ''}">
-    <div class="outfit-header">
-      <h3>${rank === 0 ? "Today's pick" : `Alternative ${rank}`}</h3>
-      <button class="wear-btn" data-rank="${rank}">I'm wearing this</button>
-    </div>
+    <h3>${rank === 0 ? "Today's pick" : `Alternative ${rank}`}</h3>
     <div class="outfit-items">${rows}</div>
     ${reasons || warnings ? `<ul class="why">${reasons}${warnings}</ul>` : ''}
   </div>`;
 }
 
 function renderWeather(wx) {
-  const [label, icon] = WMO[wx.code] || ['—', '🌡️'];
+  const [label, icon] = WMO[wx.code] || ['…', '🌡️'];
   $('#weather').innerHTML = `
     <div class="wx-icon">${icon}</div>
     <div class="wx-main">
@@ -146,27 +176,170 @@ function renderOutfits(result) {
   const el = $('#outfits');
   if (result.missing) {
     el.innerHTML = `<p class="empty">The closet has no ${esc(result.missing.join(', '))} suitable for this
-      occasion yet. Add photos to <code>closet/photos/</code> and ask Claude to catalog them.</p>`;
+      occasion yet. Use the Add clothes tab to upload photos.</p>`;
     return;
   }
   const notes = result.plan.notes.map(n => `<div class="plan-note">💡 ${esc(n)}</div>`).join('');
   el.innerHTML = notes + result.outfits.map((o, i) => outfitHTML(o, i)).join('');
-  el.querySelectorAll('.wear-btn').forEach(btn => btn.addEventListener('click', () => {
-    const o = result.outfits[Number(btn.dataset.rank)];
-    recordWear(o.items);
-    btn.textContent = 'Logged ✓ (helps tomorrow’s variety)';
-    btn.disabled = true;
-  }));
+  if (result.outfits.length) autoLogTopPick(result.outfits[0]);
 }
 
 function renderCloset() {
   const groups = { base: 'Tops (base)', mid: 'Mid layers', outer: 'Outer layers', bottom: 'Bottoms', footwear: 'Footwear', accessory: 'Accessories' };
+  const catalog = mergedCatalog();
   $('#closet').innerHTML = Object.entries(groups).map(([layer, title]) => {
-    const items = CATALOG.filter(it => it.layer === layer);
+    const items = catalog.filter(it => it.layer === layer);
     if (!items.length) return '';
     return `<h3>${title} <span class="count">${items.length}</span></h3>
-      <div class="closet-grid">${items.map(it => itemCard(it, `formality ${it.formality} · warmth ${it.warmth}`)).join('')}</div>`;
+      <div class="closet-grid">${items.map(it => itemCard(
+        it,
+        it.sample ? 'sample' : `formality ${it.formality} · warmth ${it.warmth}`,
+        it.user ? `<button class="mini-btn del-btn" data-id="${esc(it.id)}">Remove</button>` : ''
+      )).join('')}</div>`;
   }).join('');
+  $('#closet').querySelectorAll('.del-btn').forEach(btn => btn.addEventListener('click', async () => {
+    const item = userItems.find(it => it.id === btn.dataset.id);
+    if (!item || !confirm(`Remove "${item.name}" from the closet?`)) return;
+    await DBX.deletePhotos(item.photoKeys || []);
+    await DBX.deleteItem(item.id);
+    await refresh();
+  }));
+}
+
+// ------------------------------------------------------------------ add-clothes flow
+
+let pendingDrafts = [];
+
+function draftCardHTML(draft, di) {
+  const conf = k => `${Math.round(draft.confidence[k] * 100)}%`;
+  const catOpts = [...new Set(CATALOGER.CATEGORY_LABELS.map(c => c.category))]
+    .map(c => `<option value="${c}" ${c === draft.category ? 'selected' : ''}>${c}</option>`).join('');
+  const colorOpts = CATALOGER.COLOR_LABELS
+    .map(c => `<option value="${c}" ${c === draft.color ? 'selected' : ''}>${c}</option>`).join('');
+  const patOpts = CATALOGER.PATTERN_LABELS
+    .map(p => `<option value="${p.value}" ${p.value === draft.pattern ? 'selected' : ''}>${p.value}</option>`).join('');
+  const matOpts = CATALOGER.MATERIAL_LABELS
+    .map(x => `<option value="${x}" ${x === draft.material ? 'selected' : ''}>${x}</option>`).join('');
+  const mergeOpts = ['<option value="">— save as new item —</option>',
+    ...userItems.map(it => `<option value="${esc(it.id)}">add photos to: ${esc(it.name)}</option>`)].join('');
+  const photos = draft.photos.map(p => `<img class="draft-photo" src="${p.url}" alt="">`).join('');
+  return `<div class="card draft" data-di="${di}">
+    <div class="draft-photos">${photos}</div>
+    <div class="draft-fields">
+      <label>Name <input type="text" data-f="name" value="${esc(draft.name)}"></label>
+      <label>Category (${conf('category')}) <select data-f="category">${catOpts}</select></label>
+      <label>Color (${conf('color')}) <select data-f="color">${colorOpts}</select></label>
+      <label>Pattern (${conf('pattern')}) <select data-f="pattern">${patOpts}</select></label>
+      <label>Material (${conf('material')}) <select data-f="material">${matOpts}</select></label>
+      <label>Warmth <input type="number" data-f="warmth" min="1" max="5" step="0.5" value="${draft.warmth}"></label>
+      <label>Formality <input type="number" data-f="formality" min="1" max="5" step="0.5" value="${draft.formality}"></label>
+      <label>Existing piece? <select data-f="mergeInto">${mergeOpts}</select></label>
+    </div>
+  </div>`;
+}
+
+const CATEGORY_TO_LAYER = {};
+function buildCategoryLayerMap() {
+  for (const c of CATALOGER.CATEGORY_LABELS) CATEGORY_TO_LAYER[c.category] = c.layer;
+}
+
+function renderDrafts() {
+  const el = $('#review');
+  if (!pendingDrafts.length) { el.innerHTML = ''; return; }
+  el.innerHTML = `<p class="hint">Found <strong>${pendingDrafts.length}</strong> garment(s) in the photos.
+      Check the guesses below (confidence shown in parentheses), fix anything wrong, then save.</p>`
+    + pendingDrafts.map((d, i) => draftCardHTML(d, i)).join('')
+    + `<button id="save-drafts" class="primary-btn">Save all to closet</button>`;
+  $('#save-drafts').addEventListener('click', saveDrafts);
+}
+
+function readDraftEdits() {
+  document.querySelectorAll('.draft').forEach(card => {
+    const d = pendingDrafts[Number(card.dataset.di)];
+    card.querySelectorAll('[data-f]').forEach(input => {
+      const f = input.dataset.f;
+      d[f] = (f === 'warmth' || f === 'formality') ? Number(input.value) : input.value;
+    });
+    d.layer = CATEGORY_TO_LAYER[d.category] || d.layer;
+  });
+}
+
+async function saveDrafts() {
+  readDraftEdits();
+  for (const d of pendingDrafts) {
+    if (d.mergeInto) {
+      const target = userItems.find(it => it.id === d.mergeInto);
+      if (target) { await CATALOGER.addPhotosToItem(target, d.photos); continue; }
+    }
+    await CATALOGER.saveItem(d);
+  }
+  const n = pendingDrafts.length;
+  pendingDrafts = [];
+  renderDrafts();
+  await refresh();
+  $('#cat-status').textContent = `Saved ${n} garment(s) to the closet ✓`;
+}
+
+// Photos accumulate in a staging strip (from the camera one at a time, or the
+// picker in bulk), then one Analyze pass groups and classifies the whole batch.
+let stagedPhotos = []; // { file, url }
+
+function renderStaging() {
+  const el = $('#staging');
+  el.innerHTML = stagedPhotos.map((p, i) =>
+    `<div class="staged"><img src="${p.url}" alt="staged photo"><button class="unstage" data-i="${i}">✕</button></div>`).join('');
+  el.querySelectorAll('.unstage').forEach(b => b.addEventListener('click', () => {
+    const i = Number(b.dataset.i);
+    URL.revokeObjectURL(stagedPhotos[i].url);
+    stagedPhotos.splice(i, 1);
+    renderStaging();
+  }));
+  const btn = $('#analyze-btn');
+  btn.hidden = stagedPhotos.length === 0;
+  btn.textContent = `Analyze ${stagedPhotos.length} photo${stagedPhotos.length === 1 ? '' : 's'}`;
+}
+
+function stageFiles(files) {
+  for (const f of files) stagedPhotos.push({ file: f, url: URL.createObjectURL(f) });
+  renderStaging();
+}
+
+async function analyzeStaged() {
+  if (!stagedPhotos.length) return;
+  const status = $('#cat-status');
+  const btn = $('#analyze-btn');
+  btn.disabled = true;
+  try {
+    const drafts = await CATALOGER.draftGroups(stagedPhotos.map(p => p.file), msg => { status.textContent = msg; });
+    for (const d of drafts) d.name = `${d.color} ${d.category}`.replace(/^./, c => c.toUpperCase());
+    pendingDrafts = drafts;
+    stagedPhotos.forEach(p => URL.revokeObjectURL(p.url));
+    stagedPhotos = [];
+    renderStaging();
+    renderDrafts();
+    status.textContent = '';
+  } catch (err) {
+    status.textContent = `Could not analyze photos: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ------------------------------------------------------------------ export / import
+
+function exportCatalog() {
+  const data = userItems.map(({ _photoUrls, photoKeys, ...it }) => it);
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'wardrobe-catalog.json';
+  a.click();
+}
+
+async function importCatalog(file) {
+  const items = JSON.parse(await file.text());
+  for (const it of items) if (it.id && it.layer) await DBX.putItem({ ...it, user: true });
+  await refresh();
 }
 
 // ------------------------------------------------------------------ main
@@ -176,11 +349,18 @@ let currentOccasion = 'work';
 
 function rerun() {
   if (!currentWx) return;
-  renderOutfits(ENGINE.generateOutfits(CATALOG, currentWx, currentOccasion, recentWearMap()));
+  renderOutfits(ENGINE.generateOutfits(mergedCatalog(), currentWx, currentOccasion, recentWearMap()));
+}
+
+async function refresh() {
+  await loadUserItems();
+  renderCloset();
+  $('#sample-banner').hidden = !mergedCatalog().some(it => it.sample);
+  rerun();
 }
 
 async function main() {
-  if (CATALOG.some(it => it.sample)) $('#sample-banner').hidden = false;
+  buildCategoryLayerMap();
 
   document.querySelectorAll('.occ-btn').forEach(btn => btn.addEventListener('click', () => {
     document.querySelectorAll('.occ-btn').forEach(b => b.classList.toggle('active', b === btn));
@@ -192,9 +372,25 @@ async function main() {
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === btn));
     $('#today-view').hidden = btn.dataset.tab !== 'today';
     $('#closet-view').hidden = btn.dataset.tab !== 'closet';
+    $('#add-view').hidden = btn.dataset.tab !== 'add';
   }));
 
+  $('#upload-btn').addEventListener('click', () => $('#photo-input').click());
+  $('#camera-btn').addEventListener('click', () => $('#camera-input').click());
+  for (const id of ['#photo-input', '#camera-input']) {
+    $(id).addEventListener('change', e => {
+      stageFiles([...e.target.files]);
+      e.target.value = ''; // allow re-taking the same photo
+    });
+  }
+  $('#analyze-btn').addEventListener('click', analyzeStaged);
+  $('#export-btn').addEventListener('click', exportCatalog);
+  $('#import-btn').addEventListener('click', () => $('#import-input').click());
+  $('#import-input').addEventListener('change', e => e.target.files[0] && importCatalog(e.target.files[0]));
+
+  await loadUserItems();
   renderCloset();
+  $('#sample-banner').hidden = !mergedCatalog().some(it => it.sample);
 
   try {
     currentWx = await fetchWeather();

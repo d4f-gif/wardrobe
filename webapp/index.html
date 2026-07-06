@@ -12,13 +12,14 @@
     <nav>
       <button class="tab-btn active" data-tab="today">Today</button>
       <button class="tab-btn" data-tab="closet">Closet</button>
+      <button class="tab-btn" data-tab="add">Add clothes</button>
     </nav>
   </header>
 
   <div id="sample-banner" hidden>
-    Showing <strong>sample clothes</strong>. Drop photos of your own into
-    <code>closet/photos/</code>, then ask Claude to catalog them; sample items
-    get replaced as your real closet fills in.
+    Some categories still show <strong>sample clothes</strong>. Upload photos of
+    your own in the Add clothes tab; samples disappear as your real closet
+    fills in.
   </div>
 
   <main id="today-view">
@@ -37,11 +38,38 @@
   </main>
 
   <main id="closet-view" hidden>
+    <section class="card toolbar">
+      <button id="export-btn" class="mini-btn">Download catalog (JSON)</button>
+      <button id="import-btn" class="mini-btn">Import catalog</button>
+      <input type="file" id="import-input" accept="application/json" hidden>
+      <span class="hint">Photos and catalog live in this browser only; export the
+        catalog to move it to another device.</span>
+    </section>
     <section id="closet"></section>
+  </main>
+
+  <main id="add-view" hidden>
+    <section class="card">
+      <input type="file" id="photo-input" accept="image/*" multiple hidden>
+      <input type="file" id="camera-input" accept="image/*" capture="environment" hidden>
+      <button id="camera-btn" class="primary-btn">📷 Take photo</button>
+      <button id="upload-btn" class="primary-btn">🖼️ Choose photos</button>
+      <span id="cat-status" class="hint"></span>
+      <div id="staging"></div>
+      <button id="analyze-btn" class="primary-btn" hidden>Analyze photos</button>
+      <p class="hint">Take several angles of each piece, or select many photos at
+        once. On a phone, "Take photo" opens the camera; on a computer it opens
+        the file picker. Everything runs in your browser: photos never leave this
+        device. The first analysis downloads a small vision model (~100 MB,
+        cached afterwards).</p>
+    </section>
+    <section id="review"></section>
   </main>
 
   <script src="../closet/catalog.js"></script>
   <script src="engine.js"></script>
+  <script src="db.js"></script>
+  <script src="cataloger.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
