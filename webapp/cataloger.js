@@ -165,7 +165,8 @@ const CATALOGER = (() => {
   async function garmentMask(m, canvas) {
     const ctx = canvas.getContext('2d');
     const d = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const raw = new m.T.RawImage(d.data, canvas.width, canvas.height, 4);
+    // RGBA -> RGB: the RMBG feature extractor expects 3 channels
+    const raw = new m.T.RawImage(d.data, canvas.width, canvas.height, 4).rgb();
     const { pixel_values } = await m.rmbgProcessor(raw);
     const { output } = await m.rmbg({ input: pixel_values });
     const maskImg = await m.T.RawImage.fromTensor(output[0].mul(255).to('uint8'))
