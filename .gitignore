@@ -1,0 +1,18 @@
+# Adapted from the research gitignore template (Goldsmith-Pinkham);
+# closet/photos/ IS tracked — the webapp displays them and they are the
+# source of record for the catalog.
+
+# Credentials — NEVER commit
+.pgpass
+*.pgpass
+.env
+
+# OS / editor cruft
+.DS_Store
+*.swp
+
+# Python (in case helper scripts appear later)
+__pycache__/
+*.pyc
+.venv/
+venv/
