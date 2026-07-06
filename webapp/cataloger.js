@@ -75,7 +75,7 @@ const CATALOGER = (() => {
 
   // Named palette for pixel-based color naming (matches COLORS in engine.js).
   const COLOR_HEX = {
-    black: '#1a1a1a', white: '#f2f2ef', gray: '#8a8a8a', charcoal: '#3d3d3d',
+    black: '#1a1a1a', white: '#f2f2ef', 'light gray': '#c9c9c9', gray: '#8a8a8a', charcoal: '#3d3d3d',
     cream: '#f0e9d8', beige: '#d9c7a7', tan: '#c8a06a', khaki: '#b7a878',
     navy: '#1f2f52', denim: '#4a6a94', indigo: '#2a3a6b',
     brown: '#6b4a2f', camel: '#b3854d', olive: '#6b6b3f', burgundy: '#6d2033',
@@ -369,9 +369,14 @@ const CATALOGER = (() => {
     return Math.sqrt((2 + rm / 256) * dr * dr + 4 * dg * dg + (2 + (255 - rm) / 256) * db * db);
   }
 
+  const GRAYS = ['black', 'charcoal', 'gray', 'light gray', 'white'];
+
   function nearestColorName(rgb) {
-    let best = PALETTE_RGB[0], bd = Infinity;
-    for (const p of PALETTE_RGB) {
+    // desaturated tones must land on the gray scale, never on a hue
+    const sat = Math.max(...rgb) - Math.min(...rgb);
+    const candidates = sat < 26 ? PALETTE_RGB.filter(p => GRAYS.includes(p.name)) : PALETTE_RGB;
+    let best = candidates[0], bd = Infinity;
+    for (const p of candidates) {
       const d = colorDist(rgb, p.rgb);
       if (d < bd) { bd = d; best = p; }
     }
@@ -465,8 +470,9 @@ const CATALOGER = (() => {
     let mask;
     try {
       mask = await garmentMask(m, canvas);
-    } catch {
-      mask = null; // background removal failed: keep the whole photo
+    } catch (err) {
+      console.warn('background removal failed, keeping the whole photo:', err);
+      mask = null;
     }
     const boxes = mask ? findBlobs(mask, canvas.width, canvas.height) : [{ x0: 0, x1: canvas.width, y0: 0, y1: canvas.height, fullFallback: true }];
     const pieces = [];

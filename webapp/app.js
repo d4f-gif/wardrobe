@@ -25,7 +25,8 @@ const CATEGORY_EMOJI = {
 };
 
 const SWATCH_HEX = {
-  black: '#1a1a1a', white: '#f5f5f2', gray: '#8a8a8a', grey: '#8a8a8a', charcoal: '#3d3d3d',
+  black: '#1a1a1a', white: '#f5f5f2', gray: '#8a8a8a', grey: '#8a8a8a',
+  'light gray': '#c9c9c9', charcoal: '#3d3d3d',
   silver: '#c0c0c0', cream: '#f0e9d8', ivory: '#f4efe1', beige: '#d9c7a7', tan: '#c8a06a',
   khaki: '#b7a878', stone: '#c9c2b2', taupe: '#8b7d6b', navy: '#1f2f52', denim: '#4a6a94',
   indigo: '#2a3a6b', brown: '#6b4a2f', camel: '#b3854d', chocolate: '#4e342e', cognac: '#9a5b2f',

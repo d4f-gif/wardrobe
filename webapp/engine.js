@@ -19,7 +19,8 @@ const OCCASIONS = {
 // neutral: goes with everything. earth: semi-neutral, pairs widely but warm.
 const COLORS = {
   black: { neutral: true }, white: { neutral: true }, gray: { neutral: true },
-  grey: { neutral: true }, charcoal: { neutral: true }, silver: { neutral: true },
+  grey: { neutral: true }, 'light gray': { neutral: true }, charcoal: { neutral: true },
+  silver: { neutral: true },
   cream: { neutral: true }, ivory: { neutral: true }, 'off-white': { neutral: true },
   beige: { neutral: true, earth: true }, tan: { neutral: true, earth: true },
   khaki: { neutral: true, earth: true }, stone: { neutral: true, earth: true },
