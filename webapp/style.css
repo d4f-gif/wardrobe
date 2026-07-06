@@ -145,6 +145,16 @@ nav .tab-btn.active, .occ-btn.active {
   font-size: 0.9rem;
 }
 #save-drafts { margin: 6px 0 20px; }
+.angle-ask {
+  font-size: 0.85rem;
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 10%, var(--card));
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--line));
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+}
+.angle-ask .mini-btn { margin-left: 8px; color: var(--warn); border-color: var(--warn); }
 #review .hint { display: block; margin: 4px 4px 12px; }
 
 .outfit-items, .closet-grid {

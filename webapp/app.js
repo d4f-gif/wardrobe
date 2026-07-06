@@ -214,7 +214,7 @@ function draftCardHTML(draft, di) {
   const conf = k => `${Math.round(draft.confidence[k] * 100)}%`;
   const catOpts = [...new Set(CATALOGER.CATEGORY_LABELS.map(c => c.category))]
     .map(c => `<option value="${c}" ${c === draft.category ? 'selected' : ''}>${c}</option>`).join('');
-  const colorOpts = CATALOGER.COLOR_LABELS
+  const colorOpts = CATALOGER.COLOR_NAMES
     .map(c => `<option value="${c}" ${c === draft.color ? 'selected' : ''}>${c}</option>`).join('');
   const patOpts = CATALOGER.PATTERN_LABELS
     .map(p => `<option value="${p.value}" ${p.value === draft.pattern ? 'selected' : ''}>${p.value}</option>`).join('');
@@ -223,12 +223,18 @@ function draftCardHTML(draft, di) {
   const mergeOpts = ['<option value="">— save as new item —</option>',
     ...userItems.map(it => `<option value="${esc(it.id)}">add photos to: ${esc(it.name)}</option>`)].join('');
   const photos = draft.photos.map(p => `<img class="draft-photo" src="${p.url}" alt="">`).join('');
+  const angleAsk = draft.needsMoreAngles
+    ? `<div class="angle-ask">Low confidence. Add 1-2 more angles: a straight-on flat
+        shot, plus a close-up of the fabric.
+        <button class="mini-btn add-angle-btn" data-di="${di}">📷 Add angles</button></div>`
+    : '';
   return `<div class="card draft" data-di="${di}">
     <div class="draft-photos">${photos}</div>
+    ${angleAsk}
     <div class="draft-fields">
       <label>Name <input type="text" data-f="name" value="${esc(draft.name)}"></label>
       <label>Category (${conf('category')}) <select data-f="category">${catOpts}</select></label>
-      <label>Color (${conf('color')}) <select data-f="color">${colorOpts}</select></label>
+      <label>Color (from the garment's pixels) <select data-f="color">${colorOpts}</select></label>
       <label>Pattern (${conf('pattern')}) <select data-f="pattern">${patOpts}</select></label>
       <label>Material (${conf('material')}) <select data-f="material">${matOpts}</select></label>
       <label>Warmth <input type="number" data-f="warmth" min="1" max="5" step="0.5" value="${draft.warmth}"></label>
@@ -243,14 +249,38 @@ function buildCategoryLayerMap() {
   for (const c of CATALOGER.CATEGORY_LABELS) CATEGORY_TO_LAYER[c.category] = c.layer;
 }
 
+let angleTargetDraft = null;
+
 function renderDrafts() {
   const el = $('#review');
   if (!pendingDrafts.length) { el.innerHTML = ''; return; }
-  el.innerHTML = `<p class="hint">Found <strong>${pendingDrafts.length}</strong> garment(s) in the photos.
-      Check the guesses below (confidence shown in parentheses), fix anything wrong, then save.</p>`
+  el.innerHTML = `<p class="hint">Found <strong>${pendingDrafts.length}</strong> garment(s) in the photos
+      (multiple pieces in one photo get separated automatically).
+      Check the guesses below, fix anything wrong, then save.</p>`
     + pendingDrafts.map((d, i) => draftCardHTML(d, i)).join('')
     + `<button id="save-drafts" class="primary-btn">Save all to closet</button>`;
   $('#save-drafts').addEventListener('click', saveDrafts);
+  el.querySelectorAll('.add-angle-btn').forEach(btn => btn.addEventListener('click', () => {
+    readDraftEdits(); // keep any manual fixes before re-drafting
+    angleTargetDraft = pendingDrafts[Number(btn.dataset.di)];
+    $('#angle-input').click();
+  }));
+}
+
+async function handleAngleFiles(files) {
+  if (!angleTargetDraft || !files.length) return;
+  const status = $('#cat-status');
+  const draft = angleTargetDraft;
+  angleTargetDraft = null;
+  const editedName = draft.name;
+  try {
+    await CATALOGER.addAnglesToDraft(draft, [...files], msg => { status.textContent = msg; });
+    draft.name = editedName; // attribute re-draft must not clobber a typed name
+    renderDrafts();
+    status.textContent = '';
+  } catch (err) {
+    status.textContent = `Could not analyze the extra angles: ${err.message}`;
+  }
 }
 
 function readDraftEdits() {
@@ -384,6 +414,10 @@ async function main() {
     });
   }
   $('#analyze-btn').addEventListener('click', analyzeStaged);
+  $('#angle-input').addEventListener('change', e => {
+    handleAngleFiles([...e.target.files]);
+    e.target.value = '';
+  });
   $('#export-btn').addEventListener('click', exportCatalog);
   $('#import-btn').addEventListener('click', () => $('#import-input').click());
   $('#import-input').addEventListener('change', e => e.target.files[0] && importCatalog(e.target.files[0]));

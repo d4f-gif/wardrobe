@@ -53,16 +53,19 @@
     <section class="card">
       <input type="file" id="photo-input" accept="image/*" multiple hidden>
       <input type="file" id="camera-input" accept="image/*" capture="environment" hidden>
+      <input type="file" id="angle-input" accept="image/*" multiple hidden>
       <button id="camera-btn" class="primary-btn">📷 Take photo</button>
       <button id="upload-btn" class="primary-btn">🖼️ Choose photos</button>
       <span id="cat-status" class="hint"></span>
       <div id="staging"></div>
       <button id="analyze-btn" class="primary-btn" hidden>Analyze photos</button>
       <p class="hint">Take several angles of each piece, or select many photos at
-        once. On a phone, "Take photo" opens the camera; on a computer it opens
-        the file picker. Everything runs in your browser: photos never leave this
-        device. The first analysis downloads a small vision model (~100 MB,
-        cached afterwards).</p>
+        once; a photo holding several separated pieces gets split automatically.
+        Saved photos become clean catalog shots: background removed,
+        straightened, on white. On a phone, "Take photo" opens the camera; on a
+        computer it opens the file picker. Everything runs in your browser:
+        photos never leave this device. The first analysis downloads the vision
+        models (~150 MB, cached afterwards).</p>
     </section>
     <section id="review"></section>
   </main>

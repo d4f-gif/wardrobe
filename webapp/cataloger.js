@@ -1,17 +1,27 @@
 /* cataloger.js — in-browser photo cataloging, zero tokens.
-   Uses CLIP (transformers.js, loaded on demand from CDN, cached by the
-   browser) to (1) embed each uploaded photo, (2) cluster photos of the same
-   garment shot from different angles, and (3) zero-shot draft category,
-   color, pattern, and material for each garment. The user reviews and edits
-   every draft before it is saved to IndexedDB. Photos never leave the device. */
+   Pipeline per uploaded photo (all local, nothing leaves the device):
+     1. RMBG-1.4 removes the background; disconnected mask regions are
+        SEPARATE garments (one photo can hold several pieces).
+     2. Each piece is rendered as a product-style photo: cutout on white,
+        auto-straightened, light/white-balance corrected. That render is
+        what gets saved and displayed.
+     3. CLIP embeds the clean cutouts to cluster same-garment angles and
+        zero-shot-draft category/pattern/material (prompt-ensembled).
+        Color comes from the garment's own pixels (k-means -> palette),
+        which is more reliable than CLIP for color.
+     4. Low-confidence drafts are flagged so the user adds more angles.
+   The user reviews and edits every draft before it is saved to IndexedDB. */
 
 'use strict';
 
 const CATALOGER = (() => {
   const CDN = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.2';
-  const MODEL = 'Xenova/clip-vit-base-patch32';
+  const CLIP_MODEL = 'Xenova/clip-vit-base-patch32';
+  const RMBG_MODEL = 'briaai/RMBG-1.4';
   const SAME_ITEM_THRESHOLD = 0.86; // cosine similarity above this = same garment
-  const MAX_EDGE = 512;             // photos resized before embedding/storing
+  const PROC_EDGE = 1024;           // working resolution
+  const OUT_EDGE = 768;             // saved product-photo resolution
+  const MIN_BLOB_FRAC = 0.04;       // mask blobs smaller than this are noise
 
   // Zero-shot label sets. Each category label carries engine defaults.
   const CATEGORY_LABELS = [
@@ -39,9 +49,14 @@ const CATALOGER = (() => {
     { label: 'a winter hat or baseball cap', category: 'hat', layer: 'accessory', warmth: 1.5, formality: 1.5 },
   ];
 
-  const COLOR_LABELS = ['black', 'white', 'gray', 'charcoal', 'cream', 'beige', 'tan', 'khaki',
-    'navy', 'denim', 'brown', 'camel', 'olive', 'burgundy', 'red', 'orange', 'yellow', 'green',
-    'teal', 'light blue', 'blue', 'purple', 'pink'];
+  // Prompt ensembling: each label is embedded with several templates and the
+  // text embeddings averaged; the saved images ARE product shots on white,
+  // so product-style prompts match the distribution.
+  const TEMPLATES = [
+    'a photo of {}',
+    'a product photo of {}, isolated on a white background',
+    'a flat lay photo of {}',
+  ];
 
   const PATTERN_LABELS = [
     { label: 'plain solid-colored clothing with no pattern', value: 'solid' },
@@ -55,28 +70,53 @@ const CATALOGER = (() => {
 
   const MATERIAL_LABELS = ['cotton', 'wool', 'denim', 'leather', 'linen', 'synthetic', 'fleece', 'suede', 'down'];
 
-  // ---------------------------------------------------------------- model
+  // material nudges the category's default warmth
+  const MATERIAL_WARMTH = { wool: 0.5, fleece: 0.5, down: 1, linen: -0.5 };
+
+  // Named palette for pixel-based color naming (matches COLORS in engine.js).
+  const COLOR_HEX = {
+    black: '#1a1a1a', white: '#f2f2ef', gray: '#8a8a8a', charcoal: '#3d3d3d',
+    cream: '#f0e9d8', beige: '#d9c7a7', tan: '#c8a06a', khaki: '#b7a878',
+    navy: '#1f2f52', denim: '#4a6a94', indigo: '#2a3a6b',
+    brown: '#6b4a2f', camel: '#b3854d', olive: '#6b6b3f', burgundy: '#6d2033',
+    rust: '#b7410e', mustard: '#d4a017',
+    red: '#c0392b', coral: '#ee6f57', orange: '#e07b39', peach: '#f2b28c',
+    yellow: '#e8c33b', green: '#3e7c4f', sage: '#9caf88', teal: '#2f7f7f',
+    'light blue': '#a3c6e8', blue: '#3b6fb5', 'royal blue': '#2b4dbb',
+    purple: '#6a4c93', lavender: '#b9a7d6', pink: '#e29ab0', magenta: '#b03a8c',
+  };
+  const COLOR_NAMES = Object.keys(COLOR_HEX);
+
+  // ---------------------------------------------------------------- models
 
   let modelPromise = null;
 
-  function loadModel(onProgress) {
+  function loadModels(onProgress) {
     if (!modelPromise) {
       modelPromise = (async () => {
         const T = await import(CDN);
-        const opts = {
-          progress_callback: p => {
-            if (p.status === 'progress' && p.total) {
-              onProgress(`downloading model ${Math.round((p.loaded / p.total) * 100)}% (${p.file})`);
-            }
-          },
+        const prog = p => {
+          if (p.status === 'progress' && p.total) {
+            onProgress(`downloading models ${Math.round((p.loaded / p.total) * 100)}% (${p.file})`);
+          }
         };
-        const [processor, tokenizer, vision, text] = await Promise.all([
-          T.AutoProcessor.from_pretrained(MODEL, opts),
-          T.AutoTokenizer.from_pretrained(MODEL),
-          T.CLIPVisionModelWithProjection.from_pretrained(MODEL, opts),
-          T.CLIPTextModelWithProjection.from_pretrained(MODEL, opts),
+        const [processor, tokenizer, vision, text, rmbg, rmbgProcessor] = await Promise.all([
+          T.AutoProcessor.from_pretrained(CLIP_MODEL, { progress_callback: prog }),
+          T.AutoTokenizer.from_pretrained(CLIP_MODEL),
+          T.CLIPVisionModelWithProjection.from_pretrained(CLIP_MODEL, { progress_callback: prog }),
+          T.CLIPTextModelWithProjection.from_pretrained(CLIP_MODEL, { progress_callback: prog }),
+          T.AutoModel.from_pretrained(RMBG_MODEL, { config: { model_type: 'custom' }, progress_callback: prog }),
+          T.AutoProcessor.from_pretrained(RMBG_MODEL, {
+            config: {
+              do_normalize: true, do_pad: false, do_rescale: true, do_resize: true,
+              image_mean: [0.5, 0.5, 0.5], image_std: [1, 1, 1],
+              feature_extractor_type: 'ImageFeatureExtractor',
+              resample: 2, rescale_factor: 0.00392156862745098,
+              size: { width: 1024, height: 1024 },
+            },
+          }),
         ]);
-        return { T, processor, tokenizer, vision, text };
+        return { T, processor, tokenizer, vision, text, rmbg, rmbgProcessor };
       })();
       modelPromise.catch(() => { modelPromise = null; }); // allow retry after failure
     }
@@ -104,38 +144,308 @@ const CATALOGER = (() => {
     return normalize(out.map(x => x / vecs.length));
   }
 
-  // ---------------------------------------------------------------- embedding
+  // ---------------------------------------------------------------- canvas helpers
 
-  async function resizeToBlob(file) {
+  async function fileToCanvas(file) {
     const bmp = await createImageBitmap(file);
-    const scale = Math.min(1, MAX_EDGE / Math.max(bmp.width, bmp.height));
+    const scale = Math.min(1, PROC_EDGE / Math.max(bmp.width, bmp.height));
     const canvas = document.createElement('canvas');
-    canvas.width = Math.round(bmp.width * scale);
-    canvas.height = Math.round(bmp.height * scale);
+    canvas.width = Math.max(1, Math.round(bmp.width * scale));
+    canvas.height = Math.max(1, Math.round(bmp.height * scale));
     canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
-    return new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.85));
+    return canvas;
   }
 
-  async function embedBlob(m, blob) {
-    const image = await m.T.RawImage.fromBlob(blob);
-    const inputs = await m.processor(image);
+  function canvasToBlob(canvas, quality = 0.9) {
+    return new Promise(res => canvas.toBlob(res, 'image/jpeg', quality));
+  }
+
+  // ---------------------------------------------------------------- background removal
+
+  async function garmentMask(m, canvas) {
+    const ctx = canvas.getContext('2d');
+    const d = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const raw = new m.T.RawImage(d.data, canvas.width, canvas.height, 4);
+    const { pixel_values } = await m.rmbgProcessor(raw);
+    const { output } = await m.rmbg({ input: pixel_values });
+    const maskImg = await m.T.RawImage.fromTensor(output[0].mul(255).to('uint8'))
+      .resize(canvas.width, canvas.height);
+    return maskImg.data; // Uint8Array, length w*h
+  }
+
+  // Connected components on a downscaled binary mask; disconnected regions
+  // are separate garments in the same photo.
+  function findBlobs(mask, w, h) {
+    const scale = Math.min(1, 256 / Math.max(w, h));
+    const sw = Math.max(1, Math.round(w * scale)), sh = Math.max(1, Math.round(h * scale));
+    const small = new Uint8Array(sw * sh);
+    for (let y = 0; y < sh; y++)
+      for (let x = 0; x < sw; x++)
+        small[y * sw + x] = mask[Math.floor(y / scale) * w + Math.floor(x / scale)] > 128 ? 1 : 0;
+
+    const label = new Int32Array(sw * sh).fill(-1);
+    const blobs = [];
+    const stack = [];
+    for (let i = 0; i < small.length; i++) {
+      if (!small[i] || label[i] >= 0) continue;
+      const id = blobs.length;
+      let area = 0, minX = sw, maxX = 0, minY = sh, maxY = 0;
+      stack.push(i); label[i] = id;
+      while (stack.length) {
+        const p = stack.pop();
+        const px = p % sw, py = (p / sw) | 0;
+        area++;
+        if (px < minX) minX = px; if (px > maxX) maxX = px;
+        if (py < minY) minY = py; if (py > maxY) maxY = py;
+        for (const q of [p - 1, p + 1, p - sw, p + sw]) {
+          if (q < 0 || q >= small.length) continue;
+          if (Math.abs((q % sw) - px) > 1) continue; // no row wrap
+          if (small[q] && label[q] < 0) { label[q] = id; stack.push(q); }
+        }
+      }
+      blobs.push({ area, minX, maxX, minY, maxY });
+    }
+
+    let boxes = blobs
+      .filter(b => b.area / (sw * sh) >= MIN_BLOB_FRAC)
+      .map(b => ({
+        x0: Math.floor(b.minX / scale), x1: Math.ceil((b.maxX + 1) / scale),
+        y0: Math.floor(b.minY / scale), y1: Math.ceil((b.maxY + 1) / scale),
+      }));
+
+    // merge boxes that overlap (mask holes can split one garment)
+    let merged = true;
+    while (merged) {
+      merged = false;
+      outer: for (let i = 0; i < boxes.length; i++) {
+        for (let j = i + 1; j < boxes.length; j++) {
+          const a = boxes[i], b = boxes[j];
+          const ox = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0);
+          const oy = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0);
+          if (ox > 0 && oy > 0) {
+            boxes[i] = { x0: Math.min(a.x0, b.x0), x1: Math.max(a.x1, b.x1), y0: Math.min(a.y0, b.y0), y1: Math.max(a.y1, b.y1) };
+            boxes.splice(j, 1);
+            merged = true;
+            break outer;
+          }
+        }
+      }
+    }
+    // fallback: nothing confident -> whole photo is one piece
+    if (!boxes.length) boxes = [{ x0: 0, x1: w, y0: 0, y1: h, fullFallback: true }];
+    return boxes;
+  }
+
+  // ---------------------------------------------------------------- product-photo rendering
+
+  // Cutout of one piece as RGBA ImageData (alpha from the mask).
+  function cutout(canvas, mask, box) {
+    const w = canvas.width;
+    const pad = Math.round(0.03 * Math.max(box.x1 - box.x0, box.y1 - box.y0));
+    const x0 = Math.max(0, box.x0 - pad), y0 = Math.max(0, box.y0 - pad);
+    const x1 = Math.min(canvas.width, box.x1 + pad), y1 = Math.min(canvas.height, box.y1 + pad);
+    const cw = x1 - x0, ch = y1 - y0;
+    const src = canvas.getContext('2d').getImageData(x0, y0, cw, ch);
+    for (let y = 0; y < ch; y++)
+      for (let x = 0; x < cw; x++) {
+        const a = box.fullFallback ? 255 : mask[(y + y0) * w + (x + x0)];
+        src.data[(y * cw + x) * 4 + 3] = a;
+      }
+    return src;
+  }
+
+  // Gray-world white balance + percentile luminance stretch on visible pixels.
+  function autoAdjust(img) {
+    const d = img.data;
+    let n = 0, mr = 0, mg = 0, mb = 0;
+    const lumas = [];
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i + 3] < 128) continue;
+      n++; mr += d[i]; mg += d[i + 1]; mb += d[i + 2];
+      lumas.push(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
+    }
+    if (n < 50) return img;
+    mr /= n; mg /= n; mb /= n;
+    const m = (mr + mg + mb) / 3;
+    const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+    const sr = clamp(m / (mr || 1), 0.85, 1.2), sg = clamp(m / (mg || 1), 0.85, 1.2), sb = clamp(m / (mb || 1), 0.85, 1.2);
+    lumas.sort((a, b) => a - b);
+    const p2 = lumas[Math.floor(0.02 * lumas.length)], p98 = lumas[Math.floor(0.98 * lumas.length)];
+    const span = Math.max(30, p98 - p2);
+    const gain = Math.min(1.6, 235 / span);
+    for (let i = 0; i < d.length; i += 4) {
+      d[i] = clamp((d[i] * sr - p2) * gain + 15, 0, 255);
+      d[i + 1] = clamp((d[i + 1] * sg - p2) * gain + 15, 0, 255);
+      d[i + 2] = clamp((d[i + 2] * sb - p2) * gain + 15, 0, 255);
+    }
+    return img;
+  }
+
+  // Angle (degrees) that minimizes the piece's bounding box: straightens
+  // photos taken at a tilt. Conservative: only applied when it clearly helps.
+  function straightenAngle(img) {
+    const pts = [];
+    const stride = Math.max(1, Math.floor(Math.sqrt((img.width * img.height) / 1500)));
+    for (let y = 0; y < img.height; y += stride)
+      for (let x = 0; x < img.width; x += stride)
+        if (img.data[(y * img.width + x) * 4 + 3] > 128) pts.push([x, y]);
+    if (pts.length < 100) return 0;
+    const area = a => {
+      const r = (a * Math.PI) / 180, c = Math.cos(r), s = Math.sin(r);
+      let minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+      for (const [x, y] of pts) {
+        const rx = x * c - y * s, ry = x * s + y * c;
+        if (rx < minX) minX = rx; if (rx > maxX) maxX = rx;
+        if (ry < minY) minY = ry; if (ry > maxY) maxY = ry;
+      }
+      return (maxX - minX) * (maxY - minY);
+    };
+    const base = area(0);
+    let best = 0, bestArea = base;
+    for (let a = -27; a <= 27; a += 3) {
+      const v = area(a);
+      if (v < bestArea) { bestArea = v; best = a; }
+    }
+    return bestArea < base * 0.95 ? best : 0;
+  }
+
+  // Compose the final catalog shot: adjusted cutout, straightened, centered
+  // on white, longest edge OUT_EDGE.
+  function productRender(img) {
+    autoAdjust(img);
+    let c = document.createElement('canvas');
+    c.width = img.width; c.height = img.height;
+    c.getContext('2d').putImageData(img, 0, 0);
+
+    const angle = straightenAngle(img);
+    if (angle !== 0) {
+      const r = (angle * Math.PI) / 180;
+      const cw = Math.ceil(Math.abs(c.width * Math.cos(r)) + Math.abs(c.height * Math.sin(r)));
+      const ch = Math.ceil(Math.abs(c.width * Math.sin(r)) + Math.abs(c.height * Math.cos(r)));
+      const rc = document.createElement('canvas');
+      rc.width = cw; rc.height = ch;
+      const ctx = rc.getContext('2d');
+      ctx.translate(cw / 2, ch / 2);
+      ctx.rotate(r);
+      ctx.drawImage(c, -c.width / 2, -c.height / 2);
+      c = rc;
+    }
+
+    // trim to visible content
+    const d = c.getContext('2d').getImageData(0, 0, c.width, c.height);
+    let minX = c.width, maxX = 0, minY = c.height, maxY = 0;
+    for (let y = 0; y < c.height; y++)
+      for (let x = 0; x < c.width; x++)
+        if (d.data[(y * c.width + x) * 4 + 3] > 20) {
+          if (x < minX) minX = x; if (x > maxX) maxX = x;
+          if (y < minY) minY = y; if (y > maxY) maxY = y;
+        }
+    if (maxX <= minX || maxY <= minY) { minX = 0; minY = 0; maxX = c.width - 1; maxY = c.height - 1; }
+    const tw = maxX - minX + 1, th = maxY - minY + 1;
+    const margin = Math.round(0.06 * Math.max(tw, th));
+    const scale = Math.min(1, OUT_EDGE / (Math.max(tw, th) + 2 * margin));
+    const out = document.createElement('canvas');
+    out.width = Math.round((tw + 2 * margin) * scale);
+    out.height = Math.round((th + 2 * margin) * scale);
+    const octx = out.getContext('2d');
+    octx.fillStyle = '#ffffff';
+    octx.fillRect(0, 0, out.width, out.height);
+    octx.drawImage(c, minX, minY, tw, th, margin * scale, margin * scale, tw * scale, th * scale);
+    return out;
+  }
+
+  // ---------------------------------------------------------------- pixel color naming
+
+  function hexToRgb(hex) {
+    return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
+  }
+  const PALETTE_RGB = COLOR_NAMES.map(n => ({ name: n, rgb: hexToRgb(COLOR_HEX[n]) }));
+
+  // "redmean" perceptual-ish RGB distance
+  function colorDist(a, b) {
+    const rm = (a[0] + b[0]) / 2;
+    const dr = a[0] - b[0], dg = a[1] - b[1], db = a[2] - b[2];
+    return Math.sqrt((2 + rm / 256) * dr * dr + 4 * dg * dg + (2 + (255 - rm) / 256) * db * db);
+  }
+
+  function nearestColorName(rgb) {
+    let best = PALETTE_RGB[0], bd = Infinity;
+    for (const p of PALETTE_RGB) {
+      const d = colorDist(rgb, p.rgb);
+      if (d < bd) { bd = d; best = p; }
+    }
+    return best.name;
+  }
+
+  // Dominant garment colors via k-means over the cutout's visible pixels.
+  function dominantColors(img) {
+    const px = [];
+    const stride = Math.max(1, Math.floor(Math.sqrt((img.width * img.height) / 4000)));
+    for (let y = 0; y < img.height; y += stride)
+      for (let x = 0; x < img.width; x += stride) {
+        const i = (y * img.width + x) * 4;
+        if (img.data[i + 3] > 200) px.push([img.data[i], img.data[i + 1], img.data[i + 2]]);
+      }
+    if (px.length < 30) return [{ name: 'gray', weight: 1 }];
+    const K = 4;
+    let centroids = Array.from({ length: K }, (_, k) => px[Math.floor((k + 0.5) * px.length / K)].slice());
+    let assign = new Array(px.length).fill(0);
+    for (let iter = 0; iter < 8; iter++) {
+      for (let i = 0; i < px.length; i++) {
+        let bd = Infinity, bk = 0;
+        for (let k = 0; k < K; k++) {
+          const d = colorDist(px[i], centroids[k]);
+          if (d < bd) { bd = d; bk = k; }
+        }
+        assign[i] = bk;
+      }
+      const sums = Array.from({ length: K }, () => [0, 0, 0, 0]);
+      for (let i = 0; i < px.length; i++) {
+        const s = sums[assign[i]];
+        s[0] += px[i][0]; s[1] += px[i][1]; s[2] += px[i][2]; s[3]++;
+      }
+      for (let k = 0; k < K; k++) if (sums[k][3]) centroids[k] = [sums[k][0] / sums[k][3], sums[k][1] / sums[k][3], sums[k][2] / sums[k][3]];
+    }
+    const weights = new Array(K).fill(0);
+    for (const a of assign) weights[a]++;
+    const named = {};
+    for (let k = 0; k < K; k++) {
+      if (!weights[k]) continue;
+      const name = nearestColorName(centroids[k]);
+      named[name] = (named[name] || 0) + weights[k] / px.length;
+    }
+    return Object.entries(named)
+      .map(([name, weight]) => ({ name, weight }))
+      .sort((a, b) => b.weight - a.weight);
+  }
+
+  // ---------------------------------------------------------------- CLIP classification
+
+  async function embedCanvas(m, canvas) {
+    const ctx = canvas.getContext('2d');
+    const d = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const raw = new m.T.RawImage(d.data, canvas.width, canvas.height, 4).rgb();
+    const inputs = await m.processor(raw);
     const { image_embeds } = await m.vision(inputs);
     return normalize(Array.from(image_embeds.data));
   }
 
   const textCache = {};
-  async function textEmbeds(m, prompts, cacheKey) {
+  // one embedding per label = normalized mean over prompt templates
+  async function ensembleTextEmbeds(m, labels, cacheKey) {
     if (textCache[cacheKey]) return textCache[cacheKey];
+    const prompts = labels.flatMap(l => TEMPLATES.map(t => t.replace('{}', l)));
     const tokens = m.tokenizer(prompts, { padding: true, truncation: true });
     const { text_embeds } = await m.text(tokens);
     const dim = text_embeds.dims[1];
     const flat = Array.from(text_embeds.data);
-    const out = prompts.map((_, i) => normalize(flat.slice(i * dim, (i + 1) * dim)));
+    const out = labels.map((_, li) => meanVec(
+      TEMPLATES.map((_, ti) => normalize(flat.slice((li * TEMPLATES.length + ti) * dim, (li * TEMPLATES.length + ti + 1) * dim)))
+    ));
     textCache[cacheKey] = out;
     return out;
   }
 
-  // best label for an image embedding, with a softmax-ish confidence
   function classify(embed, labelEmbeds) {
     const sims = labelEmbeds.map(t => cosine(embed, t));
     const exps = sims.map(s => Math.exp(s * 100));
@@ -145,20 +455,47 @@ const CATALOGER = (() => {
     return { index: best, confidence: exps[best] / total };
   }
 
-  // ---------------------------------------------------------------- clustering
+  // ---------------------------------------------------------------- pieces & drafting
 
-  // Greedy connected components: photos whose embeddings are close enough are
-  // the same garment photographed from different angles.
-  function clusterPhotos(embeds) {
+  // One file -> one or more pieces (product blob + url + embedding + colors).
+  async function fileToPieces(m, file, sourceIndex, onProgress) {
+    const canvas = await fileToCanvas(file);
+    onProgress('removing background…');
+    let mask;
+    try {
+      mask = await garmentMask(m, canvas);
+    } catch {
+      mask = null; // background removal failed: keep the whole photo
+    }
+    const boxes = mask ? findBlobs(mask, canvas.width, canvas.height) : [{ x0: 0, x1: canvas.width, y0: 0, y1: canvas.height, fullFallback: true }];
+    const pieces = [];
+    for (const box of boxes) {
+      const img = cutout(canvas, mask || new Uint8Array(0), box);
+      const colors = dominantColors(img);
+      const product = productRender(img);
+      const blob = await canvasToBlob(product);
+      pieces.push({
+        blob, url: URL.createObjectURL(blob),
+        embed: await embedCanvas(m, product),
+        colors, sourceIndex,
+      });
+    }
+    return pieces;
+  }
+
+  // Cluster pieces into garments. Pieces cut from the SAME source photo are
+  // different garments by construction and never merge.
+  function clusterPieces(pieces) {
     const groups = [];
-    const assigned = new Array(embeds.length).fill(-1);
-    for (let i = 0; i < embeds.length; i++) {
+    const assigned = new Array(pieces.length).fill(-1);
+    for (let i = 0; i < pieces.length; i++) {
       if (assigned[i] >= 0) continue;
       const g = [i];
       assigned[i] = groups.length;
-      for (let j = i + 1; j < embeds.length; j++) {
+      for (let j = i + 1; j < pieces.length; j++) {
         if (assigned[j] >= 0) continue;
-        if (g.some(k => cosine(embeds[k], embeds[j]) >= SAME_ITEM_THRESHOLD)) {
+        if (g.some(k => pieces[k].sourceIndex === pieces[j].sourceIndex)) continue;
+        if (g.some(k => cosine(pieces[k].embed, pieces[j].embed) >= SAME_ITEM_THRESHOLD)) {
           g.push(j);
           assigned[j] = groups.length;
         }
@@ -168,45 +505,72 @@ const CATALOGER = (() => {
     return groups;
   }
 
-  // ---------------------------------------------------------------- drafting
+  // Combine each group's pixel colors: primary = highest total weight.
+  function groupColors(pieces) {
+    const agg = {};
+    for (const p of pieces) for (const c of p.colors) agg[c.name] = (agg[c.name] || 0) + c.weight;
+    const sorted = Object.entries(agg).sort((a, b) => b[1] - a[1]);
+    const total = sorted.reduce((s, [, w]) => s + w, 0) || 1;
+    const out = [sorted[0][0]];
+    if (sorted[1] && sorted[1][1] / total >= 0.25) out.push(sorted[1][0]);
+    return out;
+  }
+
+  async function attributesFor(m, pieces) {
+    const rep = meanVec(pieces.map(p => p.embed));
+    const catEmbeds = await ensembleTextEmbeds(m, CATEGORY_LABELS.map(c => c.label), 'cat');
+    const patEmbeds = await ensembleTextEmbeds(m, PATTERN_LABELS.map(p => p.label), 'pattern');
+    const matEmbeds = await ensembleTextEmbeds(m, MATERIAL_LABELS.map(x => `clothing made of ${x}`), 'material');
+    const cat = classify(rep, catEmbeds);
+    const pat = classify(rep, patEmbeds);
+    const mat = classify(rep, matEmbeds);
+    const c = CATEGORY_LABELS[cat.index];
+    const material = MATERIAL_LABELS[mat.index];
+    const colors = groupColors(pieces);
+    const needsMoreAngles = cat.confidence < 0.5 || pieces.length < 2;
+    return {
+      category: c.category, layer: c.layer,
+      warmth: Math.min(5, Math.max(1, c.warmth + (MATERIAL_WARMTH[material] || 0))),
+      formality: c.formality,
+      waterResistant: !!c.waterResistant,
+      color: colors[0], colors, pattern: PATTERN_LABELS[pat.index].value, material,
+      confidence: { category: cat.confidence, pattern: pat.confidence, material: mat.confidence },
+      needsMoreAngles,
+    };
+  }
+
+  // ---------------------------------------------------------------- public API
 
   async function draftGroups(files, onProgress) {
-    const m = await loadModel(onProgress);
-    const photos = [];
+    const m = await loadModels(onProgress);
+    const pieces = [];
     for (let i = 0; i < files.length; i++) {
-      onProgress(`analyzing photo ${i + 1} of ${files.length}…`);
-      const blob = await resizeToBlob(files[i]);
-      photos.push({ blob, url: URL.createObjectURL(blob), embed: await embedBlob(m, blob) });
+      onProgress(`photo ${i + 1} of ${files.length}: analyzing…`);
+      pieces.push(...await fileToPieces(m, files[i], i, msg => onProgress(`photo ${i + 1} of ${files.length}: ${msg}`)));
     }
-    onProgress('grouping photos into garments…');
-    const groups = clusterPhotos(photos.map(p => p.embed));
-
-    const catEmbeds = await textEmbeds(m, CATEGORY_LABELS.map(c => `a photo of ${c.label}`), 'cat');
-    const colorEmbeds = await textEmbeds(m, COLOR_LABELS.map(c => `a photo of ${c} colored clothing`), 'color');
-    const patEmbeds = await textEmbeds(m, PATTERN_LABELS.map(p => `a photo of ${p.label}`), 'pattern');
-    const matEmbeds = await textEmbeds(m, MATERIAL_LABELS.map(x => `a photo of clothing made of ${x}`), 'material');
-
-    const drafts = groups.map((idxs, gi) => {
-      const rep = meanVec(idxs.map(i => photos[i].embed));
-      const cat = classify(rep, catEmbeds);
-      const col = classify(rep, colorEmbeds);
-      const pat = classify(rep, patEmbeds);
-      const mat = classify(rep, matEmbeds);
-      const c = CATEGORY_LABELS[cat.index];
-      return {
-        groupIndex: gi,
-        photos: idxs.map(i => photos[i]),
-        category: c.category, layer: c.layer,
-        warmth: c.warmth, formality: c.formality,
-        waterResistant: !!c.waterResistant,
-        color: COLOR_LABELS[col.index],
-        pattern: PATTERN_LABELS[pat.index].value,
-        material: MATERIAL_LABELS[mat.index],
-        confidence: { category: cat.confidence, color: col.confidence, pattern: pat.confidence, material: mat.confidence },
-      };
-    });
+    onProgress('grouping pieces into garments…');
+    const groups = clusterPieces(pieces);
+    const drafts = [];
+    for (const idxs of groups) {
+      const groupPieces = idxs.map(i => pieces[i]);
+      drafts.push({ photos: groupPieces, ...(await attributesFor(m, groupPieces)) });
+    }
     onProgress('');
     return drafts;
+  }
+
+  // Extra angles for an existing draft: process, append, re-draft attributes.
+  async function addAnglesToDraft(draft, files, onProgress) {
+    const m = await loadModels(onProgress);
+    for (let i = 0; i < files.length; i++) {
+      onProgress(`extra angle ${i + 1} of ${files.length}: analyzing…`);
+      const pieces = await fileToPieces(m, files[i], -1 - i, msg => onProgress(msg));
+      // an "extra angle" photo should hold one piece; take the largest if split
+      draft.photos.push(pieces[0]);
+    }
+    Object.assign(draft, await attributesFor(m, draft.photos));
+    onProgress('');
+    return draft;
   }
 
   // ---------------------------------------------------------------- saving
@@ -225,7 +589,8 @@ const CATALOGER = (() => {
     }
     const item = {
       id, name: draft.name, category: draft.category, layer: draft.layer,
-      colors: [draft.color], pattern: draft.pattern, material: draft.material,
+      colors: draft.colors && draft.colors.length ? [draft.color, ...draft.colors.filter(c => c !== draft.color)] : [draft.color],
+      pattern: draft.pattern, material: draft.material,
       warmth: draft.warmth, formality: draft.formality,
       waterResistant: draft.waterResistant, photoKeys, user: true,
     };
@@ -243,7 +608,10 @@ const CATALOGER = (() => {
     await DBX.putItem({ ...item, photoKeys });
   }
 
-  return { CATEGORY_LABELS, COLOR_LABELS, PATTERN_LABELS, MATERIAL_LABELS, draftGroups, saveItem, addPhotosToItem };
+  return {
+    CATEGORY_LABELS, COLOR_NAMES, PATTERN_LABELS, MATERIAL_LABELS,
+    draftGroups, addAnglesToDraft, saveItem, addPhotosToItem,
+  };
 })();
 
 if (typeof window !== 'undefined') window.CATALOGER = CATALOGER;
