@@ -138,6 +138,13 @@ const CATALOGER = (() => {
     'baby blue': 'light blue', cobalt: 'royal blue', chocolate: 'brown', tan: 'tan',
   };
 
+  // A hung download or worker must surface as an error, never freeze the UI.
+  function withTimeout(promise, ms, label) {
+    let timer;
+    const guard = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out — check your connection and tap Analyze again`)), ms); });
+    return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+  }
+
   // ---------------------------------------------------------------- models (one heavy model at a time)
 
   let libPromise = null, clipPromise = null, segPromise = null;
@@ -185,13 +192,20 @@ const CATALOGER = (() => {
   // ---------------------------------------------------------------- OCR
 
   let ocrWorker = null;
+  // Best-effort: returns null (never throws) if the OCR worker can't start.
   async function loadOCR(onProgress) {
     if (ocrWorker) return ocrWorker;
     onProgress('loading text reader…');
-    const mod = await import(OCR_CDN);
-    const createWorker = mod.default.createWorker;
-    ocrWorker = await createWorker('eng');
-    return ocrWorker;
+    try {
+      const mod = await withTimeout(import(OCR_CDN), 30000, 'text reader');
+      const createWorker = mod.default.createWorker;
+      ocrWorker = await withTimeout(createWorker('eng'), 45000, 'text reader');
+      return ocrWorker;
+    } catch (err) {
+      console.warn('OCR unavailable, continuing without reading text:', err);
+      ocrWorker = null;
+      return null;
+    }
   }
   async function disposeOCR() {
     if (!ocrWorker) return;
@@ -200,10 +214,11 @@ const CATALOGER = (() => {
   }
 
   async function readText(worker, file) {
+    if (!worker) return '';
     try {
-      const { data } = await worker.recognize(URL.createObjectURL(file));
+      const { data } = await withTimeout(worker.recognize(URL.createObjectURL(file)), 25000, 'reading text');
       return data.confidence >= 40 ? data.text : '';
-    } catch { return ''; }
+    } catch (err) { console.warn('OCR skipped for one image:', err); return ''; }
   }
 
   // Parse product text into { color, category, pattern, material } (any subset)
@@ -487,7 +502,8 @@ const CATALOGER = (() => {
     const img = cutout(canvas, mask, box);
     const colors = dominantColors(img);
     const product = productRender(img);
-    return { colors, sourceIndex, categoryPrior: prior, _product: product, _needsBlob: true };
+    const areaFrac = ((box.x1 - box.x0) * (box.y1 - box.y0)) / (canvas.width * canvas.height);
+    return { colors, sourceIndex, categoryPrior: prior, areaFrac, _product: product, _needsBlob: true };
   }
 
   async function finalizePiece(p) {
@@ -568,7 +584,7 @@ const CATALOGER = (() => {
     return out;
   }
 
-  async function attributesFor(m, pieces, hintsBySource) {
+  async function attributesFor(m, pieces) {
     const rep = meanVec(pieces.map(p => p.embed));
     const prior = pieces[0].categoryPrior;
     const catLabels = prior ? CATEGORY_LABELS.filter(c => prior.includes(c.category)) : CATEGORY_LABELS;
@@ -576,50 +592,80 @@ const CATALOGER = (() => {
     const patEmbeds = await ensembleTextEmbeds(m, PATTERN_LABELS.map(p => p.label), 'pattern');
     const matEmbeds = await ensembleTextEmbeds(m, MATERIAL_LABELS.map(x => `clothing made of ${x}`), 'material');
     const cat = classify(rep, catEmbeds), pat = classify(rep, patEmbeds), mat = classify(rep, matEmbeds);
-    let c = catLabels[cat.index];
-    let material = MATERIAL_LABELS[mat.index];
-    let colors = groupColors(pieces);
-    let color = colors[0], pattern = PATTERN_LABELS[pat.index].value;
-
-    // apply product-text hints to the garment they describe
-    const hints = [...new Set(pieces.map(p => p.sourceIndex))].map(si => hintsBySource[si]).filter(Boolean);
-    let fromLabel = false;
-    const applicable = hints.filter(h => !h.category || catLayer(h.category) === c.layer);
-    if (applicable.length) {
-      const h = applicable[0];
-      fromLabel = true;
-      if (h.category && catLayer(h.category) === c.layer && CAT_BY_NAME[h.category]) c = CAT_BY_NAME[h.category];
-      if (h.color) { color = h.color; colors = [h.color, ...colors.filter(x => x !== h.color)]; }
-      if (h.pattern) pattern = h.pattern;
-      if (h.material) material = h.material;
-    }
-
+    const c = catLabels[cat.index];
+    const material = MATERIAL_LABELS[mat.index];
+    const colors = groupColors(pieces);
     const warmth = Math.min(5, Math.max(1, c.warmth + (MATERIAL_WARMTH[material] || 0)));
     return {
       category: c.category, layer: c.layer, warmth, formality: c.formality,
-      waterResistant: !!c.waterResistant, color, colors, pattern, material,
-      confidence: { category: fromLabel ? 1 : cat.confidence, pattern: fromLabel ? 1 : pat.confidence, material: fromLabel ? 1 : mat.confidence },
-      needsMoreAngles: !fromLabel && (cat.confidence < 0.5 || pieces.length < 2),
-      fromLabel,
+      waterResistant: !!c.waterResistant, color: colors[0], colors,
+      pattern: PATTERN_LABELS[pat.index].value, material,
+      areaFrac: Math.max(...pieces.map(p => p.areaFrac || 0)),
+      confidence: { category: cat.confidence, pattern: pat.confidence, material: mat.confidence },
+      needsMoreAngles: cat.confidence < 0.5 || pieces.length < 2,
+      fromLabel: false,
     };
+  }
+
+  function applyHintToDraft(d, h) {
+    if (h.category && CAT_BY_NAME[h.category]) {
+      const c = CAT_BY_NAME[h.category];
+      d.category = c.category; d.layer = c.layer; d.formality = c.formality;
+      d.waterResistant = !!c.waterResistant;
+      d.warmth = Math.min(5, Math.max(1, c.warmth + (MATERIAL_WARMTH[h.material || d.material] || 0)));
+    }
+    if (h.color) { d.color = h.color; d.colors = [h.color, ...(d.colors || []).filter(x => x !== h.color)]; }
+    if (h.pattern) d.pattern = h.pattern;
+    if (h.material) d.material = h.material;
+    d.fromLabel = true;
+    d.needsMoreAngles = false;
+  }
+
+  // Route each source image's product text to the garment it describes. Prefer
+  // a draft whose layer matches the hint's category; but if vision mislabeled
+  // the layer (skirt read as coat) or it is the only garment from that image,
+  // fall back to the largest draft. Text is ground truth and wins.
+  function applyHints(drafts, hintsBySource) {
+    const bySource = {};
+    drafts.forEach((d, di) => {
+      for (const si of new Set(d.photos.map(p => p.sourceIndex))) {
+        if (si < 0) continue;
+        (bySource[si] = bySource[si] || []).push(di);
+      }
+    });
+    for (const si of Object.keys(bySource)) {
+      const hint = hintsBySource[si];
+      if (!hint) continue;
+      const dis = bySource[si];
+      let target = hint.category ? dis.find(di => drafts[di].layer === catLayer(hint.category)) : undefined;
+      if (target === undefined) target = dis.slice().sort((a, b) => (drafts[b].areaFrac || 0) - (drafts[a].areaFrac || 0))[0];
+      if (target !== undefined) applyHintToDraft(drafts[target], hint);
+    }
   }
 
   // ---------------------------------------------------------------- public API
 
-  async function draftGroups(files, onProgress) {
-    // phase 0: OCR each image for product text
+  // ocrFlags[i] = whether to read text on file i (camera shots skip it — no
+  // product text, and it avoids a slow/fragile OCR pass on the common path).
+  async function draftGroups(files, onProgress, ocrFlags = null) {
+    const doOCR = i => (ocrFlags ? ocrFlags[i] : true);
     const hintsBySource = {};
-    const worker = await loadOCR(onProgress);
     const canvases = [];
-    for (let i = 0; i < files.length; i++) {
-      onProgress(`photo ${i + 1} of ${files.length}: reading any text…`);
-      hintsBySource[i] = parseHints(await readText(worker, files[i]));
-      canvases[i] = await fileToCanvas(files[i]);
+
+    // phase 0: OCR any images that might carry product text (best-effort)
+    if (files.some((_, i) => doOCR(i))) {
+      const worker = await loadOCR(onProgress);
+      for (let i = 0; i < files.length; i++) {
+        if (!doOCR(i)) continue;
+        onProgress(`photo ${i + 1} of ${files.length}: reading any text…`);
+        hintsBySource[i] = parseHints(await readText(worker, files[i]));
+      }
+      await disposeOCR();
     }
-    await disposeOCR();
+    for (let i = 0; i < files.length; i++) canvases[i] = await fileToCanvas(files[i]);
 
     // phase 1: clothes segmentation -> rendered pieces, then free the model
-    const s = await loadSeg(onProgress);
+    const s = await withTimeout(loadSeg(onProgress), 180000, 'model download');
     const pieces = [];
     for (let i = 0; i < files.length; i++) {
       onProgress(`photo ${i + 1} of ${files.length}: analyzing…`);
@@ -628,20 +674,21 @@ const CATALOGER = (() => {
     await disposeSeg();
 
     // phase 2: CLIP embedding, grouping, attributes
-    const m = await loadCLIP(onProgress);
+    const m = await withTimeout(loadCLIP(onProgress), 180000, 'model download');
     await embedPieces(m, pieces, onProgress);
     onProgress('grouping pieces into garments…');
     const drafts = [];
     for (const idxs of clusterPieces(pieces)) {
       const groupPieces = idxs.map(i => pieces[i]);
-      drafts.push({ photos: groupPieces, ...(await attributesFor(m, groupPieces, hintsBySource)) });
+      drafts.push({ photos: groupPieces, ...(await attributesFor(m, groupPieces)) });
     }
+    applyHints(drafts, hintsBySource);
     onProgress('');
     return drafts;
   }
 
   async function addAnglesToDraft(draft, files, onProgress) {
-    const s = await loadSeg(onProgress);
+    const s = await withTimeout(loadSeg(onProgress), 180000, 'model download');
     const fresh = [];
     for (let i = 0; i < files.length; i++) {
       onProgress(`extra angle ${i + 1} of ${files.length}: analyzing…`);
@@ -650,12 +697,12 @@ const CATALOGER = (() => {
       fresh.push(pieces[0]);
     }
     await disposeSeg();
-    const m = await loadCLIP(onProgress);
+    const m = await withTimeout(loadCLIP(onProgress), 180000, 'model download');
     await embedPieces(m, fresh, onProgress);
     // keep the draft's known class for the extra angles
     for (const p of fresh) p.categoryPrior = draft.photos[0] ? draft.photos[0].categoryPrior : null;
     draft.photos.push(...fresh);
-    Object.assign(draft, await attributesFor(m, draft.photos, {}));
+    Object.assign(draft, await attributesFor(m, draft.photos));
     onProgress('');
     return draft;
   }

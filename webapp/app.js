@@ -355,18 +355,23 @@ function renderStaging() {
   btn.textContent = `Analyze ${stagedPhotos.length} photo${stagedPhotos.length === 1 ? '' : 's'}`;
 }
 
-async function stageFiles(files) {
+// source is encoded in the key ('camera' | 'paste' | 'upload') so it survives
+// a reload; camera shots skip the OCR text-reading pass during analysis.
+async function stageFiles(files, source = 'upload') {
   for (const f of files) {
-    const key = `staging-${Date.now()}-${stagingSeq++}`;
+    const key = `staging-${source}-${Date.now()}-${stagingSeq++}`;
     await DBX.putPhoto(key, f);
-    stagedPhotos.push({ file: f, url: URL.createObjectURL(f), key });
+    stagedPhotos.push({ file: f, url: URL.createObjectURL(f), key, source });
   }
   renderStaging();
 }
 
 async function restoreStaging() {
   const rec = await DBX.listPhotos('staging-');
-  for (const r of rec) stagedPhotos.push({ file: r.blob, url: URL.createObjectURL(r.blob), key: r.key });
+  for (const r of rec) {
+    const src = ['camera', 'paste', 'upload'].includes(r.key.split('-')[1]) ? r.key.split('-')[1] : 'upload';
+    stagedPhotos.push({ file: r.blob, url: URL.createObjectURL(r.blob), key: r.key, source: src });
+  }
   if (stagedPhotos.length) renderStaging();
 }
 
@@ -414,7 +419,7 @@ async function captureFrame() {
   c.width = video.videoWidth; c.height = video.videoHeight;
   c.getContext('2d').drawImage(video, 0, 0);
   const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.9));
-  await stageFiles([new File([blob], `shot-${Date.now()}.jpg`, { type: 'image/jpeg' })]);
+  await stageFiles([new File([blob], `shot-${Date.now()}.jpg`, { type: 'image/jpeg' })], 'camera');
   $('#camera-count').textContent = `${stagedPhotos.length} staged`;
 }
 
@@ -432,7 +437,7 @@ async function pasteImages() {
       files.push(new File([blob], `pasted-${Date.now()}.${type.split('/')[1] || 'png'}`, { type }));
     }
     if (!files.length) { status.textContent = 'No image on the clipboard.'; return; }
-    await stageFiles(files);
+    await stageFiles(files, 'paste');
     status.textContent = '';
   } catch (err) {
     status.textContent = `Could not read the clipboard (${err.message}). Copy an image and try Ctrl/Cmd+V instead.`;
@@ -448,7 +453,7 @@ document.addEventListener('paste', e => {
   if (!files.length) return;
   e.preventDefault();
   activateTab('add');
-  stageFiles(files);
+  stageFiles(files, 'paste');
 });
 
 async function analyzeStaged() {
@@ -457,7 +462,8 @@ async function analyzeStaged() {
   const btn = $('#analyze-btn');
   btn.disabled = true;
   try {
-    const drafts = await CATALOGER.draftGroups(stagedPhotos.map(p => p.file), msg => { status.textContent = msg; });
+    const ocrFlags = stagedPhotos.map(p => p.source !== 'camera');
+    const drafts = await CATALOGER.draftGroups(stagedPhotos.map(p => p.file), msg => { status.textContent = msg; }, ocrFlags);
     for (const d of drafts) d.name = `${d.color} ${d.category}`.replace(/^./, c => c.toUpperCase());
     pendingDrafts = drafts;
     stagedPhotos.forEach(p => URL.revokeObjectURL(p.url));
@@ -524,12 +530,8 @@ async function main() {
   $('#camera-btn').addEventListener('click', openCamera);
   $('#camera-shutter').addEventListener('click', captureFrame);
   $('#camera-close').addEventListener('click', closeCamera);
-  for (const id of ['#photo-input', '#camera-input']) {
-    $(id).addEventListener('change', e => {
-      stageFiles([...e.target.files]);
-      e.target.value = ''; // allow re-taking the same photo
-    });
-  }
+  $('#photo-input').addEventListener('change', e => { stageFiles([...e.target.files], 'upload'); e.target.value = ''; });
+  $('#camera-input').addEventListener('change', e => { stageFiles([...e.target.files], 'camera'); e.target.value = ''; });
   $('#analyze-btn').addEventListener('click', analyzeStaged);
   $('#angle-input').addEventListener('change', e => {
     handleAngleFiles([...e.target.files]);
