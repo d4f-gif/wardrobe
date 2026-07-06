@@ -612,6 +612,8 @@ const CATALOGER = (() => {
   return {
     CATEGORY_LABELS, COLOR_NAMES, PATTERN_LABELS, MATERIAL_LABELS,
     draftGroups, addAnglesToDraft, saveItem, addPhotosToItem,
+    // stage-by-stage access for headless pipeline tests
+    _internals: { loadModels, fileToCanvas, garmentMask, findBlobs, cutout, productRender, dominantColors },
   };
 })();
 
