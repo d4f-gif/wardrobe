@@ -28,6 +28,24 @@ greenlight, append to the `CATALOG` array, run `node test/engine-test.js`,
 commit and push. Committed entries sync via git and show on every device;
 IndexedDB entries do not.
 
+## Maintenance rules
+
+- Every deploy bumps BOTH the `?v=` on the script tags in `webapp/index.html`
+  and the `bNN` build tag in the header. Phones cache aggressively; a user
+  reporting "the fix did not work" is running a stale build until proven
+  otherwise (ask for the build tag).
+- `webapp/label-embeds.json` ships precomputed CLIP text embeddings so phones
+  never load the text model. REGENERATE it whenever CATEGORY_LABELS,
+  PATTERN_LABELS, MATERIAL_LABELS, CLASS_CATS, or TEMPLATES change in
+  `webapp/cataloger.js` (headless generator pattern: session scratchpad
+  `genembeds2.py`; keep its hardcoded lists in sync). A length mismatch makes
+  phones silently fall back to the on-device text model, which crashes them.
+- The vision pipeline runs in `webapp/analysis-worker.js`, a fresh module
+  worker per analysis, terminated on completion: that is the only way wasm
+  memory returns to the OS. Keep cataloger.js worker-safe: no `document`
+  (use `makeCanvas`), no `localStorage` (use the `store` shim), globals via
+  `self`.
+
 ## Constraints
 
 - Photos taken in the app stay in IndexedDB; never suggest committing them.
