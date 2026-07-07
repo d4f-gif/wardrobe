@@ -572,7 +572,7 @@ async function main() {
   if (crash) {
     crashClear();
     activateTab('add');
-    $('#cat-status').textContent = `Last analysis did not finish — the browser stopped it at "${crash.stage}". `
+    $('#cat-status').textContent = `Last analysis did not finish; the browser stopped it at "${crash.stage}". `
       + `Your photos are still staged below. Try again with fewer photos at once, or close other tabs first.`;
   } else if (stagedPhotos.length) {
     // photos recovered from a previous session: land the user right on them
