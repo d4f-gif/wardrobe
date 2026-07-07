@@ -109,7 +109,8 @@ const CATALOGER = (() => {
   const CAT_KEYWORDS = [
     ['crop pant', 'trousers'], ['wide leg', 'trousers'], ['dress pant', 'trousers'], ['trouser', 'trousers'],
     ['chino', 'chinos'], ['jean', 'jeans'], ['legging', 'trousers'], ['shorts', 'shorts'],
-    ['skirt', 'skirt'], ['gown', 'dress'], ['dress', 'dress'],
+    ['culotte', 'trousers'], ['palazzo', 'trousers'], ['jogger', 'trousers'], ['sweatpant', 'trousers'],
+    ['slack', 'trousers'], ['skort', 'skirt'], ['skirt', 'skirt'], ['gown', 'dress'], ['dress', 'dress'],
     ['blazer', 'blazer'], ['sport coat', 'blazer'], ['suit jacket', 'blazer'],
     ['overcoat', 'coat'], ['trench', 'coat'], ['parka', 'coat'], ['peacoat', 'coat'],
     ['windbreaker', 'jacket'], ['bomber', 'jacket'], ['denim jacket', 'jacket'], ['coat', 'coat'], ['jacket', 'jacket'],
@@ -147,6 +148,10 @@ const CATALOGER = (() => {
 
   // ---------------------------------------------------------------- models (one heavy model at a time)
 
+  // Device strategy: phones keep OOM-killing the tab on the wasm (CPU) path,
+  // so try WebGPU first where available — weights and activations live in GPU
+  // memory, outside the tab's RAM budget. A canary inference validates the
+  // GPU path; any failure falls back to wasm and the choice is remembered.
   let libPromise = null, clipPromise = null, segPromise = null;
   const lib = () => (libPromise || (libPromise = import(CDN)));
   const progFor = onProgress => p => {
@@ -155,6 +160,35 @@ const CATALOGER = (() => {
     }
   };
 
+  function deviceQueue() {
+    try {
+      if (!('gpu' in navigator) || localStorage.getItem('wardrobe.device') === 'wasm') return ['wasm'];
+    } catch { return ['wasm']; }
+    return ['webgpu', 'wasm'];
+  }
+  const deviceOpts = device => device === 'webgpu' ? { device: 'webgpu', dtype: 'fp16' } : { device: 'wasm', dtype: 'q8' };
+
+  async function loadWithFallback(builder, canary, label) {
+    let lastErr;
+    for (const device of deviceQueue()) {
+      try {
+        const bundle = await builder(deviceOpts(device));
+        await canary(bundle);
+        try { if (device === 'webgpu') localStorage.setItem('wardrobe.device', 'webgpu'); } catch { /* private mode */ }
+        return bundle;
+      } catch (err) {
+        lastErr = err;
+        console.warn(`${label} unusable on ${device}, trying next:`, err);
+        try { if (device === 'webgpu') localStorage.setItem('wardrobe.device', 'wasm'); } catch { /* private mode */ }
+      }
+    }
+    throw lastErr;
+  }
+
+  function tinyImage(T) {
+    return new T.RawImage(new Uint8ClampedArray(64 * 64 * 3).fill(127), 64, 64, 3);
+  }
+
   function loadCLIP(onProgress) {
     if (!clipPromise) {
       clipPromise = (async () => {
@@ -162,9 +196,18 @@ const CATALOGER = (() => {
         const prog = progFor(onProgress);
         const processor = await T.AutoProcessor.from_pretrained(CLIP_MODEL, { progress_callback: prog });
         const tokenizer = await T.AutoTokenizer.from_pretrained(CLIP_MODEL);
-        const vision = await T.CLIPVisionModelWithProjection.from_pretrained(CLIP_MODEL, { progress_callback: prog });
-        const text = await T.CLIPTextModelWithProjection.from_pretrained(CLIP_MODEL, { progress_callback: prog });
-        return { T, processor, tokenizer, vision, text };
+        return loadWithFallback(
+          async opts => {
+            const vision = await T.CLIPVisionModelWithProjection.from_pretrained(CLIP_MODEL, { progress_callback: prog, ...opts });
+            const text = await T.CLIPTextModelWithProjection.from_pretrained(CLIP_MODEL, { progress_callback: prog, ...opts });
+            return { T, processor, tokenizer, vision, text };
+          },
+          async b => {
+            await b.vision(await processor(tinyImage(T)));
+            await b.text(tokenizer(['a'], { padding: true, truncation: true }));
+          },
+          'CLIP',
+        );
       })();
       clipPromise.catch(() => { clipPromise = null; });
     }
@@ -175,8 +218,11 @@ const CATALOGER = (() => {
     if (!segPromise) {
       segPromise = (async () => {
         const T = await lib();
-        const seg = await T.pipeline('image-segmentation', SEG_MODEL, { progress_callback: progFor(onProgress) });
-        return { T, seg };
+        return loadWithFallback(
+          async opts => ({ T, seg: await T.pipeline('image-segmentation', SEG_MODEL, { progress_callback: progFor(onProgress), ...opts }) }),
+          async b => { await b.seg(tinyImage(T)); },
+          'segmentation',
+        );
       })();
       segPromise.catch(() => { segPromise = null; });
     }
@@ -216,8 +262,15 @@ const CATALOGER = (() => {
   async function readText(worker, file) {
     if (!worker) return '';
     try {
-      const { data } = await withTimeout(worker.recognize(URL.createObjectURL(file)), 25000, 'reading text');
-      return data.confidence >= 40 ? data.text : '';
+      // downscale big screenshots first: faster and MORE reliable for OCR
+      const bmp = await createImageBitmap(file);
+      const scale = Math.min(1, 1200 / Math.max(bmp.width, bmp.height));
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(bmp.width * scale));
+      c.height = Math.max(1, Math.round(bmp.height * scale));
+      c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+      const { data } = await withTimeout(worker.recognize(c), 30000, 'reading text');
+      return data.confidence >= 25 ? data.text : '';
     } catch (err) { console.warn('OCR skipped for one image:', err); return ''; }
   }
 
@@ -683,6 +736,11 @@ const CATALOGER = (() => {
       drafts.push({ photos: groupPieces, ...(await attributesFor(m, groupPieces)) });
     }
     applyHints(drafts, hintsBySource);
+    // let the UI report which images we tried to read text from and failed
+    drafts.ocr = {
+      attempted: files.map((_, i) => i).filter(i => doOCR(i)),
+      found: Object.keys(hintsBySource).filter(k => hintsBySource[k]).map(Number),
+    };
     onProgress('');
     return drafts;
   }

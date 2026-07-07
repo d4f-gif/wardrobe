@@ -456,15 +456,35 @@ document.addEventListener('paste', e => {
   stageFiles(files, 'paste');
 });
 
+// Crash forensics: the current analysis stage is checkpointed to
+// localStorage. If the tab gets killed mid-analysis (phone OOM), the next
+// load finds the marker and reports exactly where it died.
+const CRASH_KEY = 'wardrobe.analysis';
+
+function crashMark(stage) {
+  try { localStorage.setItem(CRASH_KEY, JSON.stringify({ stage, at: new Date().toISOString(), photos: stagedPhotos.length })); } catch { /* private mode */ }
+}
+function crashClear() { try { localStorage.removeItem(CRASH_KEY); } catch { /* private mode */ } }
+function crashReport() {
+  try { return JSON.parse(localStorage.getItem(CRASH_KEY)); } catch { return null; }
+}
+
 async function analyzeStaged() {
   if (!stagedPhotos.length) return;
   const status = $('#cat-status');
   const btn = $('#analyze-btn');
   btn.disabled = true;
+  crashMark('starting');
   try {
     const ocrFlags = stagedPhotos.map(p => p.source !== 'camera');
-    const drafts = await CATALOGER.draftGroups(stagedPhotos.map(p => p.file), msg => { status.textContent = msg; }, ocrFlags);
+    const drafts = await CATALOGER.draftGroups(
+      stagedPhotos.map(p => p.file),
+      msg => { status.textContent = msg; if (msg) crashMark(msg); },
+      ocrFlags,
+    );
     for (const d of drafts) d.name = `${d.color} ${d.category}`.replace(/^./, c => c.toUpperCase());
+    // tell the user when a pasted image had no readable text
+    const unread = (drafts.ocr ? drafts.ocr.attempted.filter(i => !drafts.ocr.found.includes(i)) : []);
     pendingDrafts = drafts;
     stagedPhotos.forEach(p => URL.revokeObjectURL(p.url));
     stagedPhotos = [];
@@ -472,9 +492,13 @@ async function analyzeStaged() {
     // during review still leaves the shots recoverable on reload
     renderStaging();
     renderDrafts();
-    status.textContent = '';
+    status.textContent = unread.length
+      ? `No readable product text on ${unread.length} image(s); those used vision only — check their fields.`
+      : '';
+    crashClear();
   } catch (err) {
     status.textContent = `Could not analyze photos: ${err.message}`;
+    crashClear(); // handled: not a crash
   } finally {
     btn.disabled = false;
   }
@@ -544,7 +568,13 @@ async function main() {
   await loadUserItems();
   renderCloset();
   await restoreStaging();
-  if (stagedPhotos.length) {
+  const crash = crashReport();
+  if (crash) {
+    crashClear();
+    activateTab('add');
+    $('#cat-status').textContent = `Last analysis did not finish — the browser stopped it at "${crash.stage}". `
+      + `Your photos are still staged below. Try again with fewer photos at once, or close other tabs first.`;
+  } else if (stagedPhotos.length) {
     // photos recovered from a previous session: land the user right on them
     activateTab('add');
     $('#cat-status').textContent = `Restored ${stagedPhotos.length} photo${stagedPhotos.length === 1 ? '' : 's'} from your last session.`;

@@ -37,6 +37,7 @@ body {
 
 header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
 h1 { font-size: 1.5rem; }
+.build { font-size: 0.7rem; color: var(--muted); font-weight: 400; vertical-align: super; }
 
 nav .tab-btn, .occ-btn {
   background: var(--card);
